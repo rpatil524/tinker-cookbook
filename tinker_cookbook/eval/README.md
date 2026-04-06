@@ -57,17 +57,17 @@ results = await run_benchmarks(
 | mbpp | Single-turn | Code execution | Modal |
 | ceval | Single-turn | Programmatic (MCQA, Chinese) | — |
 | supergpqa | Single-turn | Programmatic (MCQA, 4-10 options) | — |
+| ifbench | Single-turn | IF constraints (58 types) | 67.3% on Qwen3.5-35B-A3B (official 70.2%). Requires `ifbench` package. |
 
 **Experimental benchmarks** (``_``-prefixed modules) — functional but need further validation:
 
 | Benchmark | Type | Grading | Status |
 |-----------|------|---------|--------|
-| hmmt_feb_2025 | Single-turn | LaTeX answer (normalized string) | Experimental — no symbolic math comparison |
-| hmmt_nov_2025 | Single-turn | LaTeX answer (normalized string) | Experimental — no symbolic math comparison |
+| hmmt_feb_2025 | Single-turn | LaTeX answer (sympy) | Sympy grading, requires antlr4 |
+| hmmt_nov_2025 | Single-turn | LaTeX answer (sympy) | Sympy grading, requires antlr4 |
 | arena_hard | Single-turn | LLM-as-judge | Works with self-judge, needs cross-model judge |
 | longbench | Single-turn | Programmatic | Limited by 65K context window |
 | livecodebench | Single-turn | Code execution (Modal) | 47.4% on Qwen3.5-35B-A3B (needs 1800s timeout) |
-| ifbench | Single-turn | IF constraints | Verifier doesn't cover IFBench instruction types |
 | bfcl | Single-turn | Function call AST | Ground truth format mismatch |
 | terminal_bench | Multi-turn | Sandbox + tests (Modal) | 27.7% on Qwen3.5-35B-A3B (ctx overflow on 65K model) |
 | swe_bench | Multi-turn | Sandbox + pytest (Modal) | 0% — 65K context too small for multi-turn repo exploration |
@@ -75,15 +75,26 @@ results = await run_benchmarks(
 
 **Prerequisites:**
 
-Install all eval dependencies with:
+Install all eval dependencies at once:
 
 ```bash
-pip install 'tinker-cookbook[eval]'
+uv pip install 'tinker-cookbook[eval]'
 ```
 
-This includes Modal (sandbox execution), math-verify (math grading), and antlr4 (sympy LaTeX parsing for HMMT).
+Or install only what you need per benchmark:
+
+```bash
+uv pip install 'tinker-cookbook[eval-math500]'        # math-verify, pylatexenc, sympy
+uv pip install 'tinker-cookbook[eval-hmmt]'            # antlr4 for sympy LaTeX parsing
+uv pip install 'tinker-cookbook[eval-mbpp]'            # Modal sandbox
+uv pip install 'tinker-cookbook[eval-livecodebench]'   # Modal sandbox
+uv pip install 'tinker-cookbook[eval-terminal-bench]'  # Modal sandbox
+uv pip install 'tinker-cookbook[eval-swe-bench]'       # Modal sandbox
+uv pip install 'tinker-cookbook[eval-ifbench]'         # nltk, emoji, syllapy, langdetect
+```
 
 Additional setup:
+- **IFBench**: Also requires ``uv pip install 'ifbench @ git+https://github.com/allenai/IFBench.git'`` (not on PyPI). The benchmark raises ``ImportError`` without it.
 - **HF auth (gated)**: Set `HF_TOKEN` or run `huggingface-cli login` for gated datasets (GPQA).
 - **Modal auth**: Run `modal token new` for sandbox benchmarks (MBPP, LiveCodeBench, Terminal Bench, SWE-bench).
 - **`judge_sampling_client`**: Benchmarks using LLM-as-judge or user simulation require a separate Tinker sampling client for the judge model. Pass via `BenchmarkConfig(judge_sampling_client=..., judge_renderer=...)`.
@@ -188,12 +199,11 @@ register(MyBenchmarkBuilder())
 ```
 
 Key points:
-- Use `MessageEnv` + `EnvFromMessageEnv` for automatic thinking-token stripping and context overflow handling
-- `Env` objects are single-use (no reset)
-- Set `multi_turn = True` on the builder for agent/sandbox benchmarks (uses lower concurrency)
-- Include a stable `example_id` in `logs` for cross-run comparison (e.g., hash of the question)
-- The runner handles concurrency, timeouts, resumability, and JSONL storage automatically
-- For sandbox-based benchmarks, use the `SandboxMixin` from `_common.py` for cleanup. The runner calls `cleanup()` on timeout or error to prevent resource leaks.
+- **`MessageEnv` + `EnvFromMessageEnv`**: Thinking-token stripping and context overflow handling are automatic. Your `step()` receives a clean message with thinking already removed.
+- **`example_id`**: Set `self.example_id` on your MessageEnv for stable cross-run comparison and resumability. Use `make_example_id(prefix, text)` for a deterministic content hash. `EnvFromMessageEnv` forwards it automatically. Without it, the runner falls back to positional index (fragile).
+- **`failed_parse_reward=0.0, context_overflow_reward=0.0`**: Truncated or unparseable responses score 0 and are tracked in `BenchmarkResult.num_truncated`.
+- **Sandbox benchmarks**: Use `SandboxMixin` from `_common.py` and set `requires_sandbox = True` on the builder. See `mbpp.py` for an example.
+- **Multi-turn benchmarks**: Set `multi_turn = True` on the builder (uses `agent_concurrency` instead of `concurrency`). See `_terminal_bench.py` for an example.
 
 ## 3. EvalStore — Cross-Checkpoint Comparison
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 import math
@@ -39,7 +40,7 @@ from tinker_cookbook.eval.benchmarks._types import (
 from tinker_cookbook.exceptions import BenchmarkNotFoundError, EvalTimeoutError
 from tinker_cookbook.renderers.base import Renderer
 from tinker_cookbook.rl.rollouts import do_single_rollout
-from tinker_cookbook.rl.types import Trajectory
+from tinker_cookbook.rl.types import Env, Trajectory
 
 logger = logging.getLogger(__name__)
 
@@ -49,12 +50,36 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+_warned_no_example_id: set[str] = set()
+
+
+def _get_example_id(env: Env, idx: int, benchmark_name: str = "") -> str:
+    """Get the stable ``example_id`` from an env, falling back to ``str(idx)``.
+
+    ``example_id`` is set on ``EnvFromMessageEnv`` (forwarded from the inner
+    ``MessageEnv``). For raw ``Env`` implementations that don't set it,
+    falls back to the positional index and logs a one-time warning.
+    """
+    eid = getattr(env, "example_id", None)
+    if eid:
+        return eid
+    if benchmark_name and benchmark_name not in _warned_no_example_id:
+        _warned_no_example_id.add(benchmark_name)
+        logger.warning(
+            f"  {benchmark_name} envs have no example_id. Using positional index "
+            f"which is unstable across shuffles and pass@k rounds. Set example_id "
+            f"on your MessageEnv (use make_example_id from _common.py)."
+        )
+    return str(idx)
+
+
 def _trajectory_to_stored(
     idx: int,
     trajectory: Trajectory,
     benchmark_name: str,
     tokenizer,
     time_seconds: float,
+    example_id: str,
 ) -> StoredTrajectory:
     """Convert a Trajectory to a StoredTrajectory with decoded text."""
     turns: list[StoredTurn] = []
@@ -92,8 +117,8 @@ def _trajectory_to_stored(
         all_metrics.update(t.metrics)
         all_logs.update(t.logs)
 
-    # Use example_id from logs if provided by the Env, otherwise fall back to idx
-    example_id = all_logs.pop("example_id", str(idx))
+    # Remove example_id from logs (already stored as a top-level field)
+    all_logs.pop("example_id", None)
 
     return StoredTrajectory(
         idx=idx,
@@ -131,18 +156,17 @@ class _ResumedExample:
         self.is_error = is_error
 
 
-def _load_completed(save_dir: str, benchmark_name: str) -> dict[int, _ResumedExample]:
-    """Load completed trajectory indices with rewards and metrics from disk.
+def _load_completed(save_dir: str, benchmark_name: str) -> dict[str, _ResumedExample]:
+    """Load completed trajectories keyed by ``example_id``.
 
-    Returns a dict mapping example index to its restored reward, metrics,
-    and error status. The metrics are needed to correctly count truncations
-    (``max_tokens_reached``, ``context_overflow``) on resume. The error
-    flag is needed to correctly count ``num_errors``.
+    Uses ``example_id`` (content-hash) instead of positional ``idx``,
+    making resumability robust to dataset shuffling and ``max_examples``
+    changes between runs.
     """
     path = Path(save_dir) / benchmark_name / "trajectories.jsonl"
     if not path.exists():
         return {}
-    results: dict[int, _ResumedExample] = {}
+    results: dict[str, _ResumedExample] = {}
     with open(path) as f:
         for line_num, line in enumerate(f, 1):
             line = line.strip()
@@ -150,7 +174,8 @@ def _load_completed(save_dir: str, benchmark_name: str) -> dict[int, _ResumedExa
                 continue
             try:
                 d = json.loads(line)
-                results[d["idx"]] = _ResumedExample(
+                eid = d.get("example_id") or str(d["idx"])
+                results[eid] = _ResumedExample(
                     reward=d.get("reward", 0.0),
                     metrics=d.get("metrics", {}),
                     is_error=d.get("error") is not None,
@@ -415,6 +440,11 @@ async def run_benchmark(
             f"limitations and status."
         )
 
+    # Apply benchmark's recommended system_prompt if user didn't set one
+    if config.system_prompt is None and benchmark.recommended_system_prompt is not None:
+        config = dataclasses.replace(config, system_prompt=benchmark.recommended_system_prompt)
+        logger.info("  Using benchmark's recommended system_prompt")
+
     t0 = time.monotonic()
     num_samples = config.num_samples
 
@@ -430,7 +460,7 @@ async def run_benchmark(
 
     # Resume: load completed examples from disk (only for single-sample mode;
     # pass@k mode always runs fresh to get exactly num_samples per example)
-    completed: dict[int, _ResumedExample] = {}
+    completed: dict[str, _ResumedExample] = {}
     if config.save_dir and num_samples == 1:
         completed = _load_completed(config.save_dir, benchmark.name)
         if completed:
@@ -455,23 +485,28 @@ async def run_benchmark(
     metrics_list: list[Metrics] = [{} for _ in range(len(envs))]
     num_errors = 0
     num_completed = 0
-    total_to_run = len(envs) - len(completed)
 
-    # Pre-fill from resumed results (rewards, metrics, and error counts)
-    for idx, ex in completed.items():
-        if idx < len(rewards):
+    # Build idx -> example_id mapping and pre-fill from resumed results
+    env_example_ids: list[str] = []
+    for idx, env in enumerate(envs):
+        eid = _get_example_id(env, idx, benchmark.name)
+        env_example_ids.append(eid)
+        if eid in completed:
+            ex = completed[eid]
             rewards[idx] = ex.reward
             metrics_list[idx] = ex.metrics
             if ex.is_error:
                 num_errors += 1
+
+    total_to_run = sum(1 for eid in env_example_ids if eid not in completed)
 
     tokenizer = renderer.tokenizer
 
     async def run_one(idx: int, env) -> None:
         nonlocal num_completed, num_errors
 
-        # Skip already-completed
-        if idx in completed:
+        # Skip already-completed (matched by example_id, not positional idx)
+        if env_example_ids[idx] in completed:
             return
 
         async with sem:
@@ -510,7 +545,12 @@ async def run_benchmark(
                 # Save trajectory with decoded text
                 if config.save_dir:
                     stored = _trajectory_to_stored(
-                        idx, trajectory, benchmark.name, tokenizer, elapsed
+                        idx,
+                        trajectory,
+                        benchmark.name,
+                        tokenizer,
+                        elapsed,
+                        example_id=_get_example_id(env, idx),
                     )
                     if config.grade_fn is not None:
                         stored.reward = total_reward
@@ -536,7 +576,7 @@ async def run_benchmark(
                             reward=0.0,
                             error=f"timeout ({config.timeout_seconds}s)",
                             time_seconds=elapsed,
-                            example_id=getattr(env, "example_id", ""),
+                            example_id=_get_example_id(env, idx),
                         ),
                     )
 
@@ -557,7 +597,7 @@ async def run_benchmark(
                             reward=0.0,
                             error=str(e),
                             time_seconds=elapsed,
-                            example_id=getattr(env, "example_id", ""),
+                            example_id=_get_example_id(env, idx),
                         ),
                     )
 
@@ -637,6 +677,7 @@ async def run_benchmark(
         num_errors = 0
         num_completed = 0
         completed = {}  # No resumability in pass@k mode
+        env_example_ids = [_get_example_id(e, i) for i, e in enumerate(sample_envs)]
         total_to_run = len(sample_envs)
 
         await asyncio.gather(*[run_one(i, env) for i, env in enumerate(sample_envs)])
@@ -647,9 +688,7 @@ async def run_benchmark(
         for idx, (r, m) in enumerate(zip(rewards, metrics_list)):
             if r is None:
                 continue
-            # Determine example_id: prefer env attribute, fall back to idx
-            example_id = getattr(sample_envs[idx], "example_id", "") or str(idx)
-            per_example_rewards.setdefault(example_id, []).append(r)
+            per_example_rewards.setdefault(env_example_ids[idx], []).append(r)
             all_rewards.append(r)
             all_metrics.append(m)
 
